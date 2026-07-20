@@ -39,6 +39,11 @@ export const DEFAULT_SETTINGS = {
   paperAutoEntriesPerTick: 1,
   paperReentryCooldownMin: 30,
 
+  // active = enough PAPER trades to test the strategy:
+  // relaxed discovery thresholds, but obvious scam checks stay blocking.
+  // strict = every dashboard entry rule + every security check must pass.
+  paperStrategyProfile: "active",
+
   sniperEnabled: true,
   copytradeEnabled: true,
   buySizeSol: 0.1,          // sniper position size

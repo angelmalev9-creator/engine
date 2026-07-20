@@ -174,6 +174,7 @@ export async function openPositionFor({ userId, profile, settings, mint, snapsho
   let result = { signature: null, quote: null, dryRun: true };
   let actualSpentSol = amountSol;
   let actualTokenRaw = 0;
+  let entryPriceUsd = Number(snapshot?.priceUsd || 0);
 
   if (live) {
     const keypair = await userKeypair(userId);
@@ -209,24 +210,35 @@ export async function openPositionFor({ userId, profile, settings, mint, snapsho
       );
     }
 
-    // Real Jupiter market quote, but no transaction is signed or broadcast.
-    result = await buySol(
-      null,
-      mint,
-      amountSol,
-      settings.slippageBps,
-      true
-    );
+    const marketPriceUsd = Number(snapshot?.priceUsd || 0);
+    const marketPriceNative = Number(snapshot?.priceNative || 0);
 
-    actualTokenRaw = Number(result.quote?.outAmount || 0);
-
-    if (!actualTokenRaw) {
-      throw new Error("Jupiter returned no paper entry amount");
+    if (!Number.isFinite(marketPriceUsd) || marketPriceUsd <= 0) {
+      throw new Error("No live DEX market price for PAPER entry");
     }
+
+    const slippage = Math.max(0, Number(settings.slippageBps || 0)) / 10_000;
+    entryPriceUsd = marketPriceUsd * (1 + slippage);
+
+    // token_amount_raw is used only as the PAPER position quantity marker.
+    // PAPER exits are valued from the real live price, so no fake blockchain
+    // transaction or token route is required.
+    actualTokenRaw = marketPriceNative > 0
+      ? amountSol / (marketPriceNative * (1 + slippage))
+      : amountSol / entryPriceUsd;
+
+    result = {
+      signature: null,
+      quote: {
+        source: "dexscreener-live-paper-fill",
+        outAmount: actualTokenRaw,
+      },
+      dryRun: true,
+    };
   }
 
-  if (!actualTokenRaw) {
-    actualTokenRaw = Number(result.quote?.outAmount || 0);
+  if (!actualTokenRaw && result.quote?.outAmount) {
+    actualTokenRaw = Number(result.quote.outAmount);
   }
 
   const position = await q.insertPosition({
@@ -237,9 +249,9 @@ export async function openPositionFor({ userId, profile, settings, mint, snapsho
     mint,
     symbol: snapshot?.baseToken?.symbol || mint.slice(0, 6),
     entry_sol: actualSpentSol,
-    entry_price_usd: snapshot?.priceUsd ?? null,
+    entry_price_usd: entryPriceUsd || snapshot?.priceUsd || null,
     token_amount_raw: actualTokenRaw,
-    peak_price_usd: snapshot?.priceUsd ?? null,
+    peak_price_usd: entryPriceUsd || snapshot?.priceUsd || null,
     entry_volume_5m: snapshot?.volume5m ?? null,
     buy_signature: result.signature,
   });
@@ -307,30 +319,26 @@ export async function closePositionFor(position, reason, snapshot) {
       }
     }
   } else if (position.status === "alert") {
-    const rawToSell = Number(position.token_amount_raw || 0);
+    const paperQuantity = Number(position.token_amount_raw || 0);
+    const currentMarketPrice = Number(snapshot?.priceUsd || 0);
+    const entryPrice = Number(position.entry_price_usd || 0);
+    const entrySol = Number(position.entry_sol || 0);
 
-    if (rawToSell <= 0) {
-      throw new Error("PAPER position has no token amount and was kept open");
+    if (!Number.isFinite(currentMarketPrice) || currentMarketPrice <= 0) {
+      throw new Error("No live DEX market price for PAPER exit; position kept open");
     }
 
-    // Real current Jupiter exit quote. No private key, signature or broadcast.
-    const result = await sellAll(
-      null,
-      position.mint,
-      rawToSell,
-      settings.slippageBps,
-      true
-    );
-
-    actualSolOut = result.quote
-      ? Number(result.quote.outAmount) / 1e9
-      : null;
-    actualTokenSold = rawToSell;
-    reconciliationReason = `${reason}; PAPER execution using live Jupiter quote`;
-
-    if (actualSolOut === null || !Number.isFinite(actualSolOut)) {
-      throw new Error("Jupiter returned no paper exit quote; position kept open");
+    if (!Number.isFinite(entryPrice) || entryPrice <= 0 || entrySol <= 0) {
+      throw new Error("PAPER entry accounting is incomplete; position kept open");
     }
+
+    const slippage = Math.max(0, Number(settings.slippageBps || 0)) / 10_000;
+    const exitFillPrice = currentMarketPrice * (1 - slippage);
+
+    actualSolOut = entrySol * (exitFillPrice / entryPrice);
+    actualTokenSold = paperQuantity;
+    reconciliationReason =
+      `${reason}; PAPER fill at live DEX price with ${Number(settings.slippageBps || 0)} bps slippage`;
   }
 
   const exitPrice = snapshot?.priceUsd ?? position.entry_price_usd;

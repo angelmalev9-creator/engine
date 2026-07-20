@@ -15,6 +15,7 @@ import {
   getMarketChart,
   getMarketFeed,
   getMarketToken,
+  marketAutoTradeTick,
   marketDiscoveryTick,
   marketRefreshTick,
   marketSecurityTick,
@@ -366,14 +367,15 @@ const safe = (name, fn) => () =>
 
 refreshWatchers().catch(() => {});
 
-// Strategy scanner.
-setInterval(safe("sniper discovery", sniperTick), 30_000);
-setInterval(safe("sniper refresh", refreshMarketData), 5_000);
-
 // DEX-style dense market feed.
 setInterval(safe("market discovery", marketDiscoveryTick), 60_000);
 setInterval(safe("market feed refresh", marketRefreshTick), 5_000);
 setInterval(safe("market security", marketSecurityTick), 10_000);
+
+// The visible V3 scanner is now the automatic PAPER strategy source.
+// One tick can open only the configured number of positions and never sends
+// a blockchain transaction while the user's mode is PAPER.
+setInterval(safe("market auto PAPER trader", marketAutoTradeTick), 5_000);
 
 // Positions and KOL copytrading.
 setInterval(safe("exits", manageAllPositions), 10_000);
@@ -381,11 +383,21 @@ setInterval(safe("copytrade", copytradeTick), 4_000);
 setInterval(safe("watchers", refreshWatchers), 60_000);
 
 safe("market discovery", marketDiscoveryTick)();
-safe("sniper discovery", sniperTick)();
+
+setTimeout(
+  safe("initial market refresh", marketRefreshTick),
+  1_500
+);
+
+setTimeout(
+  safe("initial market auto PAPER trader", marketAutoTradeTick),
+  4_000
+);
 
 app.listen(config.port, () => {
   console.log(`Emerald Gate V3 engine on :${config.port}`);
   console.log("Dense market rows refresh every 5 seconds");
+  console.log("Dense scanner auto PAPER trader runs every 5 seconds");
   console.log("KOL wallets poll every 4 seconds");
   console.log(
     `Global live-money switch: ${

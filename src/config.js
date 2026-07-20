@@ -28,6 +28,10 @@ export const config = {
 // "Best settings" defaults. Each user can override any of these from the
 // dashboard; missing keys always fall back to these values.
 export const DEFAULT_SETTINGS = {
+  // PAPER is the safe default. LIVE must be selected explicitly by the user
+  // and is still protected by the Railway LIVE_TRADING kill switch.
+  tradingMode: "paper",
+  paperStartingSol: 10,
   sniperEnabled: true,
   copytradeEnabled: true,
   buySizeSol: 0.1,          // sniper position size

@@ -124,6 +124,19 @@ function pruneProcessed() {
   }
 }
 
+
+function paperCopySecurityPass(gate) {
+  const checks = gate?.checks || {};
+
+  // PAPER copying keeps clear scam blockers, but an unverifiable LP-match is a
+  // warning rather than a reason to erase the KOL performance sample.
+  return Boolean(
+    checks.authorities?.pass &&
+    checks.topHolders?.pass &&
+    checks.rugcheck?.pass
+  );
+}
+
 function securityFailureReason(gate) {
   const failed = Object.entries(gate?.checks || {})
     .filter(([, check]) => !check?.pass)
@@ -341,24 +354,30 @@ async function mirrorToFollowers(trader, traderSignature, { mint, side }, follow
       if (side === "buy") {
         if (!snapshot) {
           blockReason = "no live primary market pair after 15s retry";
+        } else if (settings.tradingMode === "paper") {
+          if (!paperCopySecurityPass(gate)) {
+            blockReason = securityFailureReason(gate);
+          } else {
+            const position = await openPositionFor({
+              userId,
+              profile,
+              settings,
+              mint,
+              snapshot,
+              source: "copytrade",
+              copiedFrom: trader,
+              sizeSol: settings.copySizeSol,
+            });
+
+            executed = Boolean(position);
+            blockReason = position
+              ? gate?.pass
+                ? "PAPER trade opened with live Jupiter quote"
+                : "PAPER trade opened; LP verification warning"
+              : "max positions reached or token already open";
+          }
         } else if (!gate?.pass) {
           blockReason = securityFailureReason(gate);
-        } else if (settings.tradingMode === "paper") {
-          const position = await openPositionFor({
-            userId,
-            profile,
-            settings,
-            mint,
-            snapshot,
-            source: "copytrade",
-            copiedFrom: trader,
-            sizeSol: settings.copySizeSol,
-          });
-
-          executed = Boolean(position);
-          blockReason = position
-            ? "PAPER trade opened with live Jupiter quote"
-            : "max positions reached or token already open";
         } else if (profile.plan !== "pro") {
           blockReason = "LIVE trading requires PRO";
         } else if (!config.liveTrading) {

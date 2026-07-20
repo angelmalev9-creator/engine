@@ -1,28 +1,37 @@
 // Conservative copytrading engine.
 // A transaction is copied only when it contains swap/buy/sell program evidence
-// AND an opposite quote-asset flow (SOL/WSOL/USDC/USDT) for the tracked wallet.
+// and an opposite quote-asset flow for the tracked wallet.
+//
+// Persistent deduplication is claimed in Supabase BEFORE any live trade occurs.
+// Run copy-events-dedupe.sql before deploying this file.
 import { PublicKey } from "@solana/web3.js";
 import { config, mergeSettings } from "./config.js";
 import { kolscanLeaderboard } from "./kolscan.js";
 import { withRpc } from "./rpc.js";
 import { runSecurityGate } from "./security.js";
-import { q } from "./supabase.js";
+import { q, sb } from "./supabase.js";
 import { closePositionFor, marketSnapshot, openPositionFor } from "./trading.js";
 import { balanceSol, ensureUserWallet } from "./wallets.js";
 
 const QUOTE_MINTS = new Set([
-  "So11111111111111111111111111111111111111112", // WSOL
-  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
-  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
+  "So11111111111111111111111111111111111111112",
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
 ]);
+
 const EPS = 1e-12;
 const MIN_NATIVE_FLOW_SOL = 0.00001;
 const GATE_TTL = 5 * 60_000;
 const SIGNATURE_TTL = 30 * 60_000;
+const PAIR_RETRY_DELAYS_MS = [0, 5_000, 10_000];
 
-const watchers = new Map(); // address -> { lastSig, followers }
-const gateCache = new Map(); // mint:pair -> result
-const processed = new Map(); // address:signature -> timestamp
+const watchers = new Map();
+const gateCache = new Map();
+const processed = new Map();
+
+let tickRunning = false;
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function keyString(key) {
   if (typeof key === "string") return key;
@@ -39,7 +48,9 @@ function ownerString(owner) {
 }
 
 function uiAmount(balance) {
-  const value = balance?.uiTokenAmount?.uiAmountString ?? balance?.uiTokenAmount?.uiAmount ?? 0;
+  const value = balance?.uiTokenAmount?.uiAmountString ??
+    balance?.uiTokenAmount?.uiAmount ??
+    0;
   const number = Number(value);
   return Number.isFinite(number) ? number : 0;
 }
@@ -51,14 +62,17 @@ function hasSwapInstruction(tx) {
 
 function tokenDeltas(tx, trader) {
   const delta = new Map();
+
   for (const balance of tx.meta?.postTokenBalances || []) {
     if (ownerString(balance.owner) !== trader) continue;
     delta.set(balance.mint, (delta.get(balance.mint) || 0) + uiAmount(balance));
   }
+
   for (const balance of tx.meta?.preTokenBalances || []) {
     if (ownerString(balance.owner) !== trader) continue;
     delta.set(balance.mint, (delta.get(balance.mint) || 0) - uiAmount(balance));
   }
+
   return delta;
 }
 
@@ -69,14 +83,11 @@ function nativeSolDelta(tx, trader) {
 
   const pre = Number(tx.meta?.preBalances?.[index] || 0);
   const post = Number(tx.meta?.postBalances?.[index] || 0);
-  // The first account is normally the fee payer. Add the fee back so the value
-  // represents trade flow rather than network cost.
   const feeAdjustment = index === 0 ? Number(tx.meta?.fee || 0) : 0;
+
   return (post - pre + feeAdjustment) / 1e9;
 }
 
-// Returns one verified target movement. Ambiguous multi-token movements,
-// transfers and airdrops are ignored instead of being mislabeled as swaps.
 function detectVerifiedSwap(tx, trader) {
   if (!tx?.meta || tx.meta.err || !hasSwapInstruction(tx)) return null;
 
@@ -92,8 +103,10 @@ function detectVerifiedSwap(tx, trader) {
     .filter(([quoteMint]) => QUOTE_MINTS.has(quoteMint))
     .map(([, delta]) => delta);
 
-  const quoteOut = nativeDelta < -MIN_NATIVE_FLOW_SOL || quoteDeltas.some(delta => delta < -EPS);
-  const quoteIn = nativeDelta > MIN_NATIVE_FLOW_SOL || quoteDeltas.some(delta => delta > EPS);
+  const quoteOut = nativeDelta < -MIN_NATIVE_FLOW_SOL ||
+    quoteDeltas.some(delta => delta < -EPS);
+  const quoteIn = nativeDelta > MIN_NATIVE_FLOW_SOL ||
+    quoteDeltas.some(delta => delta > EPS);
 
   if (targetDelta > 0 && quoteOut) {
     return { mint, side: "buy", targetDelta, nativeDelta, verified: true };
@@ -106,7 +119,78 @@ function detectVerifiedSwap(tx, trader) {
 
 function pruneProcessed() {
   const cutoff = Date.now() - SIGNATURE_TTL;
-  for (const [key, ts] of processed) if (ts < cutoff) processed.delete(key);
+  for (const [key, ts] of processed) {
+    if (ts < cutoff) processed.delete(key);
+  }
+}
+
+function securityFailureReason(gate) {
+  const failed = Object.entries(gate?.checks || {})
+    .filter(([, check]) => !check?.pass)
+    .map(([name, check]) => `${name}: ${check?.detail || "failed"}`);
+
+  return failed.length
+    ? `security blocked — ${failed.join(" | ")}`
+    : "failed security gate";
+}
+
+async function marketSnapshotWithRetry(mint) {
+  let last = null;
+
+  for (const delay of PAIR_RETRY_DELAYS_MS) {
+    if (delay) await sleep(delay);
+    last = await marketSnapshot(mint).catch(() => null);
+    if (last) return last;
+  }
+
+  return last;
+}
+
+async function claimCopyEvent({ userId, trader, traderSignature, side, mint }) {
+  const existing = await sb
+    .from("copy_events")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("trader_signature", traderSignature)
+    .maybeSingle();
+
+  if (existing.error) {
+    throw new Error(`Supabase dedupe check: ${existing.error.message}`);
+  }
+  if (existing.data) return null;
+
+  const inserted = await sb
+    .from("copy_events")
+    .insert({
+      user_id: userId,
+      trader_address: trader,
+      trader_signature: traderSignature,
+      side,
+      mint,
+      executed: false,
+      block_reason: "processing",
+      our_signature: null,
+    })
+    .select("id")
+    .single();
+
+  if (inserted.error?.code === "23505") return null;
+  if (inserted.error) {
+    throw new Error(`Supabase event claim: ${inserted.error.message}`);
+  }
+
+  return inserted.data.id;
+}
+
+async function finalizeCopyEvent(id, patch) {
+  const result = await sb
+    .from("copy_events")
+    .update(patch)
+    .eq("id", id);
+
+  if (result.error) {
+    throw new Error(`Supabase event finalize: ${result.error.message}`);
+  }
 }
 
 export async function refreshWatchers() {
@@ -115,124 +199,181 @@ export async function refreshWatchers() {
   const users = await q.allProfiles();
 
   const followerMap = new Map();
+
   const add = (address, userId) => {
     if (!followerMap.has(address)) followerMap.set(address, new Set());
     followerMap.get(address).add(userId);
   };
 
   for (const trader of manual) add(trader.address, trader.user_id);
+
   for (const user of users) {
     const settings = mergeSettings(await q.settings(user.id));
     if (!settings.copytradeEnabled || !settings.followKolscanTop) continue;
-    for (const trader of kol.slice(0, settings.followKolscanTop)) add(trader.address, user.id);
+
+    for (const trader of kol.slice(0, settings.followKolscanTop)) {
+      add(trader.address, user.id);
+    }
   }
 
   for (const address of watchers.keys()) {
     if (!followerMap.has(address)) watchers.delete(address);
   }
+
   for (const [address, followers] of followerMap) {
-    if (!watchers.has(address)) watchers.set(address, { lastSig: null, followers });
-    else watchers.get(address).followers = followers;
+    if (!watchers.has(address)) {
+      watchers.set(address, { lastSig: null, followers });
+    } else {
+      watchers.get(address).followers = followers;
+    }
   }
 }
 
-async function scamGateCached(mint, primaryPairAddress) {
+async function securityGateCached(mint, primaryPairAddress) {
   const key = `${mint}:${primaryPairAddress || "unknown"}`;
   const hit = gateCache.get(key);
   if (hit && Date.now() - hit.ts < GATE_TTL) return hit;
 
-  const result = await runSecurityGate(mint, { primaryPairAddress }).catch(error => ({
-    pass: false,
-    checks: { error: { pass: false, detail: error.message } },
-  }));
+  const result = await runSecurityGate(mint, { primaryPairAddress })
+    .catch(error => ({
+      pass: false,
+      checks: { error: { pass: false, detail: error.message } },
+    }));
+
   const entry = { ts: Date.now(), ...result };
   gateCache.set(key, entry);
   return entry;
 }
 
 export async function copytradeTick() {
-  pruneProcessed();
+  if (tickRunning) return;
+  tickRunning = true;
 
-  for (const [address, watcher] of watchers) {
-    try {
-      const signatures = await withRpc(connection =>
-        connection.getSignaturesForAddress(new PublicKey(address), { limit: 50 })
-      );
-      if (!signatures.length) continue;
+  try {
+    pruneProcessed();
 
-      const newest = signatures[0].signature;
-      if (!watcher.lastSig) {
-        watcher.lastSig = newest;
-        continue; // warm start: never replay historical trades
-      }
-
-      const fresh = [];
-      for (const item of signatures) {
-        if (item.signature === watcher.lastSig) break;
-        if (!item.err) fresh.push(item.signature);
-      }
-      watcher.lastSig = newest;
-
-      for (const signature of fresh.reverse().slice(-10)) {
-        const dedupeKey = `${address}:${signature}`;
-        if (processed.has(dedupeKey)) continue;
-        processed.set(dedupeKey, Date.now());
-
-        const tx = await withRpc(connection =>
-          connection.getParsedTransaction(signature, {
-            maxSupportedTransactionVersion: 0,
-            commitment: "confirmed",
-          })
+    for (const [address, watcher] of watchers) {
+      try {
+        const signatures = await withRpc(connection =>
+          connection.getSignaturesForAddress(new PublicKey(address), { limit: 50 })
         );
-        const swap = detectVerifiedSwap(tx, address);
-        if (swap) await mirrorToFollowers(address, signature, swap, watcher.followers);
+
+        if (!signatures.length) continue;
+        const newest = signatures[0].signature;
+
+        if (!watcher.lastSig) {
+          watcher.lastSig = newest;
+          continue;
+        }
+
+        const fresh = [];
+        for (const item of signatures) {
+          if (item.signature === watcher.lastSig) break;
+          if (!item.err) fresh.push(item.signature);
+        }
+        watcher.lastSig = newest;
+
+        for (const signature of fresh.reverse().slice(-10)) {
+          const dedupeKey = `${address}:${signature}`;
+          if (processed.has(dedupeKey)) continue;
+          processed.set(dedupeKey, Date.now());
+
+          const tx = await withRpc(connection =>
+            connection.getParsedTransaction(signature, {
+              maxSupportedTransactionVersion: 0,
+              commitment: "confirmed",
+            })
+          );
+
+          const swap = detectVerifiedSwap(tx, address);
+          if (swap) {
+            await mirrorToFollowers(address, signature, swap, watcher.followers);
+          }
+        }
+      } catch (error) {
+        console.error(`watch ${address.slice(0, 6)}: ${error.message}`);
       }
-    } catch (e) {
-      console.error(`watch ${address.slice(0, 6)}: ${e.message}`);
     }
+  } finally {
+    tickRunning = false;
   }
 }
 
 async function mirrorToFollowers(trader, traderSignature, { mint, side }, followers) {
-  const snap = await marketSnapshot(mint).catch(() => null);
-  const gate = side === "buy"
-    ? await scamGateCached(mint, snap?.pairAddress || null)
+  const snapshot = side === "buy"
+    ? await marketSnapshotWithRetry(mint)
+    : await marketSnapshot(mint).catch(() => null);
+
+  const gate = side === "buy" && snapshot
+    ? await securityGateCached(mint, snapshot.pairAddress || null)
     : null;
 
   for (const userId of followers) {
+    let eventId = null;
+
     try {
+      eventId = await claimCopyEvent({
+        userId,
+        trader,
+        traderSignature,
+        side,
+        mint,
+      });
+
+      if (!eventId) continue;
+
       const profile = await q.profile(userId);
       const settings = mergeSettings(await q.settings(userId));
-      if (!settings.copytradeEnabled) continue;
+
+      if (!settings.copytradeEnabled) {
+        await finalizeCopyEvent(eventId, {
+          executed: false,
+          block_reason: "copytrading disabled",
+          our_signature: null,
+        });
+        continue;
+      }
 
       let executed = false;
       let blockReason = null;
       let ourSignature = null;
 
       if (side === "buy") {
-        if (!snap) blockReason = "no live primary market pair";
-        else if (!gate.pass) blockReason = "failed security gate";
-        else if (profile.plan !== "pro") blockReason = "FOMO plan — watch only";
-        else if (!config.liveTrading) blockReason = "engine in signal mode";
-        else {
+        if (!snapshot) {
+          blockReason = "no live primary market pair after 15s retry";
+        } else if (!gate?.pass) {
+          blockReason = securityFailureReason(gate);
+        } else if (profile.plan !== "pro") {
+          blockReason = "FOMO plan — watch only";
+        } else if (!config.liveTrading) {
+          blockReason = "engine in signal mode";
+        } else {
           const publicKey = await ensureUserWallet(userId);
           const balance = await balanceSol(publicKey).catch(() => 0);
-          if (balance < settings.copySizeSol + 0.01) {
-            blockReason = "insufficient balance";
+          const required = Number(settings.copySizeSol) + 0.01;
+
+          if (balance < required) {
+            blockReason = `insufficient balance: ${balance.toFixed(4)} SOL < ${required.toFixed(4)} SOL required`;
           } else {
             const position = await openPositionFor({
               userId,
               profile,
               settings,
               mint,
-              snapshot: snap,
+              snapshot,
               source: "copytrade",
               copiedFrom: trader,
               sizeSol: settings.copySizeSol,
             });
+
             executed = Boolean(position?.buy_signature);
             ourSignature = position?.buy_signature || null;
-            if (!position) blockReason = "max positions / duplicate";
+
+            if (!position) {
+              blockReason = "max positions reached or token already open";
+            } else if (!executed) {
+              blockReason = "position created without a live transaction";
+            }
           }
         }
       } else {
@@ -244,25 +385,28 @@ async function mirrorToFollowers(trader, traderSignature, { mint, side }, follow
         );
 
         if (open) {
-          await closePositionFor(open, `copytrade: ${trader.slice(0, 6)} sold`, snap);
+          await closePositionFor(open, `copytrade: ${trader.slice(0, 6)} sold`, snapshot);
           executed = open.status === "open";
         } else {
           blockReason = "no copied position";
         }
       }
 
-      await q.insertCopyEvent({
-        user_id: userId,
-        trader_address: trader,
-        trader_signature: traderSignature,
-        side,
-        mint,
+      await finalizeCopyEvent(eventId, {
         executed,
-        block_reason: blockReason,
+        block_reason: executed ? null : blockReason,
         our_signature: ourSignature,
       });
-    } catch (e) {
-      console.error(`mirror ${userId}: ${e.message}`);
+    } catch (error) {
+      if (eventId) {
+        await finalizeCopyEvent(eventId, {
+          executed: false,
+          block_reason: `engine error: ${error.message}`,
+          our_signature: null,
+        }).catch(() => {});
+      }
+
+      console.error(`mirror ${userId}: ${error.message}`);
     }
   }
 }

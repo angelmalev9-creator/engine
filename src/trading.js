@@ -102,20 +102,77 @@ export async function scamCheck(mint) {
   };
 }
 
-function userIsLive(profile) {
-  return config.liveTrading && profile.plan === "pro";
+function userIsLive(profile, settings) {
+  return settings.tradingMode === "live" && config.liveTrading && profile.plan === "pro";
+}
+
+export function paperSummary(positions, settings) {
+  const startingSol = Math.max(0, Number(settings.paperStartingSol || 10));
+  const paperOpen = positions.filter(position => position.status === "alert" && !position.buy_signature);
+  const paperClosed = positions.filter(position => position.status === "closed" && !position.buy_signature);
+
+  const investedSol = paperOpen.reduce(
+    (sum, position) => sum + Number(position.entry_sol || 0),
+    0
+  );
+
+  const realizedPnlSol = paperClosed.reduce(
+    (sum, position) => sum + Number(position.pnl_sol || 0),
+    0
+  );
+
+  const unrealizedPnlSol = paperOpen.reduce((sum, position) => {
+    const entrySol = Number(position.entry_sol || 0);
+    const changePct = Number(position.last_change_pct || 0);
+    return sum + entrySol * (changePct / 100);
+  }, 0);
+
+  const cashSol = startingSol - investedSol + realizedPnlSol;
+  const openValueSol = investedSol + unrealizedPnlSol;
+  const equitySol = cashSol + openValueSol;
+
+  return {
+    startingSol,
+    cashSol,
+    investedSol,
+    openValueSol,
+    equitySol,
+    realizedPnlSol,
+    unrealizedPnlSol,
+    openPositions: paperOpen.length,
+    closedTrades: paperClosed.filter(position => position.pnl_pct !== null).length,
+  };
 }
 
 export async function openPositionFor({ userId, profile, settings, mint, snapshot, source, copiedFrom, sizeSol }) {
-  const open = (await q.userPositions(userId, 100))
-    .filter(position => position.status === "open" || position.status === "alert");
-  if (open.length >= settings.maxOpenPositions || open.some(position => position.mint === mint)) {
+  const positions = await q.userPositions(userId, 200);
+  const active = positions.filter(
+    position => position.status === "open" || position.status === "alert"
+  );
+
+  if (
+    active.length >= settings.maxOpenPositions ||
+    active.some(position => position.mint === mint)
+  ) {
     return null;
   }
 
-  const live = userIsLive(profile);
+  const requestedLive = settings.tradingMode === "live";
+  const live = userIsLive(profile, settings);
+
+  if (requestedLive && !live) {
+    throw new Error("LIVE mode is unavailable: requires PRO plan and Railway LIVE_TRADING=true");
+  }
+
+  const paper = !requestedLive;
+  const amountSol = Number(sizeSol);
+
+  if (!Number.isFinite(amountSol) || amountSol <= 0) {
+    throw new Error("Invalid position size");
+  }
+
   let result = { signature: null, quote: null, dryRun: true };
-  let actualSpentSol = Number(sizeSol);
+  let actualSpentSol = amountSol;
   let actualTokenRaw = 0;
 
   if (live) {
@@ -123,22 +180,54 @@ export async function openPositionFor({ userId, profile, settings, mint, snapsho
     const publicKey = keypair.publicKey.toBase58();
     const before = await walletSnapshot(publicKey, mint);
 
-    result = await buySol(keypair, mint, sizeSol, settings.slippageBps, false);
-    const after = await waitForWalletChange(publicKey, mint, before, "buy");
+    result = await buySol(
+      keypair,
+      mint,
+      amountSol,
+      settings.slippageBps,
+      false
+    );
+
+    const after = await waitForWalletChange(
+      publicKey,
+      mint,
+      before,
+      "buy"
+    );
 
     const measuredSpent = before.sol - after.sol;
     const measuredTokens = after.tokenRaw - before.tokenRaw;
+
     if (measuredSpent > 0) actualSpentSol = measuredSpent;
     if (measuredTokens > 0) actualTokenRaw = measuredTokens;
-  } else {
-    try {
-      result = await buySol(null, mint, sizeSol, settings.slippageBps, true);
-    } catch {
-      // Quote is optional in alert mode. No fake signature is created.
+  } else if (paper) {
+    const summary = paperSummary(positions, settings);
+
+    if (summary.cashSol + 1e-9 < amountSol) {
+      throw new Error(
+        `PAPER balance too low: ${summary.cashSol.toFixed(4)} SOL available, ${amountSol.toFixed(4)} SOL requested`
+      );
+    }
+
+    // Real Jupiter market quote, but no transaction is signed or broadcast.
+    result = await buySol(
+      null,
+      mint,
+      amountSol,
+      settings.slippageBps,
+      true
+    );
+
+    actualTokenRaw = Number(result.quote?.outAmount || 0);
+
+    if (!actualTokenRaw) {
+      throw new Error("Jupiter returned no paper entry amount");
     }
   }
 
-  if (!actualTokenRaw) actualTokenRaw = Number(result.quote?.outAmount || 0);
+  if (!actualTokenRaw) {
+    actualTokenRaw = Number(result.quote?.outAmount || 0);
+  }
 
   const position = await q.insertPosition({
     user_id: userId,
@@ -165,55 +254,100 @@ export async function openPositionFor({ userId, profile, settings, mint, snapsho
       token_amount: actualTokenRaw,
     });
   }
+
   return position;
 }
-
 export async function closePositionFor(position, reason, snapshot) {
   let signature = null;
   let actualSolOut = null;
   let actualTokenSold = null;
   let reconciliationReason = reason;
 
+  const profile = await q.profile(position.user_id);
+  const settings = mergeSettings(await q.settings(position.user_id));
+
   if (position.status === "open") {
-    const profile = await q.profile(position.user_id);
-    const settings = mergeSettings(await q.settings(position.user_id));
+    if (!userIsLive(profile, settings)) {
+      throw new Error("Live sell is disabled; real position kept open");
+    }
+
     const keypair = await userKeypair(position.user_id);
     const publicKey = keypair.publicKey.toBase58();
     const before = await walletSnapshot(publicKey, position.mint);
-    const rawToSell = before.tokenRaw > 0 ? before.tokenRaw : Number(position.token_amount_raw || 0);
+    const rawToSell = before.tokenRaw > 0
+      ? before.tokenRaw
+      : Number(position.token_amount_raw || 0);
 
     if (before.tokenRaw <= 0) {
-      // The bot cannot claim a sale it did not observe. This usually means the
-      // tokens were moved or sold outside Emerald Gate.
       reconciliationReason = `${reason}; token balance missing — external movement suspected`;
     } else if (rawToSell > 0) {
-      const live = userIsLive(profile);
-      if (!live) {
-        throw new Error("Live sell is disabled or the account is not PRO; position kept open");
-      }
-      const result = await sellAll(keypair, position.mint, rawToSell, settings.slippageBps, false);
+      const result = await sellAll(
+        keypair,
+        position.mint,
+        rawToSell,
+        settings.slippageBps,
+        false
+      );
+
       signature = result.signature;
 
       if (signature) {
-        const after = await waitForWalletChange(publicKey, position.mint, before, "sell");
+        const after = await waitForWalletChange(
+          publicKey,
+          position.mint,
+          before,
+          "sell"
+        );
+
         const measuredOut = after.sol - before.sol;
         const measuredSold = before.tokenRaw - after.tokenRaw;
+
         actualSolOut = measuredOut > 0 ? measuredOut : null;
         actualTokenSold = measuredSold > 0 ? measuredSold : rawToSell;
-      } else {
-        actualSolOut = result.quote ? Number(result.quote.outAmount) / 1e9 : null;
-        actualTokenSold = rawToSell;
       }
+    }
+  } else if (position.status === "alert") {
+    const rawToSell = Number(position.token_amount_raw || 0);
+
+    if (rawToSell <= 0) {
+      throw new Error("PAPER position has no token amount and was kept open");
+    }
+
+    // Real current Jupiter exit quote. No private key, signature or broadcast.
+    const result = await sellAll(
+      null,
+      position.mint,
+      rawToSell,
+      settings.slippageBps,
+      true
+    );
+
+    actualSolOut = result.quote
+      ? Number(result.quote.outAmount) / 1e9
+      : null;
+    actualTokenSold = rawToSell;
+    reconciliationReason = `${reason}; PAPER execution using live Jupiter quote`;
+
+    if (actualSolOut === null || !Number.isFinite(actualSolOut)) {
+      throw new Error("Jupiter returned no paper exit quote; position kept open");
     }
   }
 
   const exitPrice = snapshot?.priceUsd ?? position.entry_price_usd;
   const entrySol = Number(position.entry_sol || 0);
+
   const marketPnlPct = position.entry_price_usd
-    ? ((Number(exitPrice) - Number(position.entry_price_usd)) / Number(position.entry_price_usd)) * 100
+    ? ((Number(exitPrice) - Number(position.entry_price_usd)) /
+        Number(position.entry_price_usd)) * 100
     : null;
-  const actualPnlSol = actualSolOut !== null && entrySol > 0 ? actualSolOut - entrySol : null;
-  const actualPnlPct = actualPnlSol !== null && entrySol > 0 ? (actualPnlSol / entrySol) * 100 : null;
+
+  const actualPnlSol = actualSolOut !== null && entrySol > 0
+    ? actualSolOut - entrySol
+    : null;
+
+  const actualPnlPct = actualPnlSol !== null && entrySol > 0
+    ? (actualPnlSol / entrySol) * 100
+    : null;
 
   await q.updatePosition(position.id, {
     status: "closed",
@@ -232,11 +366,12 @@ export async function closePositionFor(position, reason, snapshot) {
       signature,
       mint: position.mint,
       sol_amount: actualSolOut,
-      token_amount: -Number(actualTokenSold ?? position.token_amount_raw ?? 0),
+      token_amount: -Number(
+        actualTokenSold ?? position.token_amount_raw ?? 0
+      ),
     });
   }
 }
-
 // Exit engine — runs over every active position of every user.
 export async function manageAllPositions() {
   const positions = await q.allActivePositions();

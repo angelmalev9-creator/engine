@@ -17,7 +17,7 @@ import {
   topBoosted,
 } from "./dexscreener.js";
 import { mergeSettings } from "./config.js";
-import { runSecurityGate } from "./security.js";
+import { checkAuthorities, runSecurityGate } from "./security.js";
 import { q } from "./supabase.js";
 import { evaluateToken, openPositionFor } from "./trading.js";
 
@@ -42,8 +42,8 @@ let securityRunning = false;
 let autoTradeRunning = false;
 
 const AUTO_EVALUATION_TTL = 30_000;
-const AUTO_MAX_EVALUATIONS_PER_TICK = 15;
-const AUTO_MAX_INSPECTIONS_PER_TICK = 90;
+const AUTO_MAX_EVALUATIONS_PER_TICK = 30;
+const AUTO_MAX_INSPECTIONS_PER_TICK = 180;
 
 let autoCandidateCursor = 0;
 const autoEvaluationCache = new Map();
@@ -600,6 +600,75 @@ function addRejection(rejections, reason) {
   rejections[key] = (rejections[key] || 0) + 1;
 }
 
+
+function activePaperPrefilter(item) {
+  if (!item?.mint || !item.pair_address) {
+    return { pass: false, reason: "missing pair" };
+  }
+
+  if (item.market_stale || Number(item.price_usd) <= 0) {
+    return { pass: false, reason: "stale market" };
+  }
+
+  // ACTIVE PAPER exists to build a real performance sample. It uses broad,
+  // deterministic market-quality requirements rather than the STRICT gate.
+  if (
+    item.age_minutes !== null &&
+    item.age_minutes !== undefined &&
+    Number(item.age_minutes) > 10_080
+  ) {
+    return { pass: false, reason: "pair older than 7 days" };
+  }
+
+  if (safeNumber(item.liquidity_usd) < 500) {
+    return { pass: false, reason: "liquidity below $500" };
+  }
+
+  if (safeNumber(item.txns_5m) < 2) {
+    return { pass: false, reason: "fewer than 2 txns in 5m" };
+  }
+
+  if (safeNumber(item.buys_5m) < 1) {
+    return { pass: false, reason: "no buy in the last 5m" };
+  }
+
+  if (safeNumber(item.change_5m) <= -90) {
+    return { pass: false, reason: "5m collapse below -90%" };
+  }
+
+  return { pass: true };
+}
+
+function explicitAuthorityDanger(check) {
+  if (!check || check.pass) return false;
+
+  const detail = String(check.detail || "").toLowerCase();
+
+  // Provider/RPC gaps are warnings in PAPER mode, not fake passes in LIVE.
+  if (
+    detail.includes("not readable") ||
+    detail.includes("unavailable") ||
+    detail.includes("timeout") ||
+    detail.includes("429") ||
+    detail.includes("503")
+  ) {
+    return false;
+  }
+
+  return (
+    detail.includes("mintauthority=") ||
+    detail.includes("freezeauthority=")
+  );
+}
+
+function rejectionSummary(rejections) {
+  return Object.entries(rejections)
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 3)
+    .map(([reason, count]) => `${reason}=${count}`)
+    .join(", ");
+}
+
 function evaluationCacheKey(mint, entry) {
   return `${mint}:${JSON.stringify(entry)}`;
 }
@@ -650,7 +719,7 @@ export async function marketAutoTradeTick() {
   let opened = 0;
   let enabledUsers = 0;
   let inspected = 0;
-  let lastDecision = "no PAPER user had entry capacity";
+  let lastDecision = "waiting for a PAPER account";
   let profileName = "active";
   const rejections = {};
 
@@ -664,27 +733,33 @@ export async function marketAutoTradeTick() {
         !item.market_stale &&
         Number(item.price_usd) > 0
       )
-      .sort((left, right) =>
-        safeNumber(right.trend_score) - safeNumber(left.trend_score)
-      );
+      .sort((left, right) => {
+        const leftScore =
+          safeNumber(left.trend_score) +
+          Math.log10(Math.max(1, safeNumber(left.liquidity_usd))) * 18;
 
-    if (!rankedMarkets.length) {
-      lastDecision = "market feed has no fresh priced pairs yet";
-      addRejection(rejections, lastDecision);
-    }
+        const rightScore =
+          safeNumber(right.trend_score) +
+          Math.log10(Math.max(1, safeNumber(right.liquidity_usd))) * 18;
+
+        return rightScore - leftScore;
+      });
 
     const startIndex = rankedMarkets.length
       ? autoCandidateCursor % rankedMarkets.length
       : 0;
 
-    // Rotate through the full feed instead of evaluating the same top three
-    // rejected tokens forever.
     const rotatedMarkets = rankedMarkets.length
       ? [
           ...rankedMarkets.slice(startIndex),
           ...rankedMarkets.slice(0, startIndex),
         ]
       : [];
+
+    if (!rotatedMarkets.length) {
+      lastDecision = "market feed has no fresh priced pairs";
+      addRejection(rejections, lastDecision);
+    }
 
     for (const profile of profiles) {
       const settings = mergeSettings(await q.settings(profile.id));
@@ -703,13 +778,7 @@ export async function marketAutoTradeTick() {
           ? "strict"
           : "active";
 
-      const entry =
-        profileName === "strict"
-          ? settings.entry
-          : activePaperEntry(settings.entry);
-
       const positions = await q.userPositions(profile.id, 250);
-
       const active = positions.filter(position =>
         position.status === "open" || position.status === "alert"
       );
@@ -731,7 +800,6 @@ export async function marketAutoTradeTick() {
       );
 
       let remainingEntries = Math.min(capacity, entriesThisTick);
-
       const cooldownMinutes = Math.max(
         0,
         Number(settings.paperReentryCooldownMin || 30)
@@ -744,55 +812,94 @@ export async function marketAutoTradeTick() {
 
         inspected += 1;
 
-        const prefilter = entryPrefilter(item, entry);
-
-        if (!prefilter.pass) {
-          lastDecision = prefilter.reason;
-          addRejection(rejections, prefilter.reason);
-          continue;
-        }
-
         if (
           active.some(position => position.mint === item.mint) ||
           recentMintCooldown(positions, item.mint, cooldownMinutes)
         ) {
-          lastDecision = "mint open or in re-entry cooldown";
-          addRejection(rejections, lastDecision);
+          addRejection(rejections, "open or cooldown");
           continue;
         }
 
-        evaluations += 1;
+        let snapshot = null;
 
-        let evaluation;
+        if (profileName === "strict") {
+          const evaluation = await cachedAutoEvaluation(
+            item.mint,
+            settings.entry
+          ).catch(error => ({
+            tradeReady: false,
+            snapshot: null,
+            checks: {
+              error: { pass: false, detail: error.message },
+            },
+          }));
 
-        try {
-          evaluation = await cachedAutoEvaluation(item.mint, entry);
-        } catch (error) {
-          lastDecision = `evaluation error: ${error.message}`;
-          addRejection(rejections, lastDecision);
-          continue;
-        }
+          evaluations += 1;
 
-        const velocityPass = Object.values(
-          evaluation.checks || {}
-        ).every(check => check.pass);
+          if (!evaluation.tradeReady || !evaluation.snapshot) {
+            const reason =
+              failedCheckText(evaluation) ||
+              "strict strategy/security failed";
 
-        const securityPass =
-          profileName === "strict"
-            ? Boolean(evaluation.tradeReady)
-            : (
-                velocityPass &&
-                activePaperSecurityPass(evaluation.security)
-              );
+            lastDecision = reason;
+            addRejection(rejections, reason);
+            continue;
+          }
 
-        if (!securityPass || !evaluation.snapshot) {
-          const failed =
-            failedCheckText(evaluation) ||
-            "candidate failed strategy/security";
+          snapshot = evaluation.snapshot;
+        } else {
+          const prefilter = activePaperPrefilter(item);
 
-          lastDecision = failed;
-          addRejection(rejections, failed);
-          continue;
+          if (!prefilter.pass) {
+            lastDecision = prefilter.reason;
+            addRejection(rejections, prefilter.reason);
+            continue;
+          }
+
+          evaluations += 1;
+
+          const authority = await checkAuthorities(item.mint)
+            .catch(error => ({
+              pass: false,
+              detail: `authority check unavailable: ${error.message}`,
+            }));
+
+          if (explicitAuthorityDanger(authority)) {
+            lastDecision = "active mint/freeze authority";
+            addRejection(rejections, lastDecision);
+            continue;
+          }
+
+          // The scanner item already contains a current real DEXScreener
+          // snapshot. PAPER execution uses this live market data directly.
+          snapshot = {
+            pairAddress: item.pair_address,
+            dexId: item.dex_id,
+            baseToken: {
+              address: item.mint,
+              symbol: item.symbol,
+              name: item.name,
+            },
+            quoteToken: {
+              symbol: item.quote_symbol || "SOL",
+            },
+            priceUsd: Number(item.price_usd),
+            priceNative: Number(item.price_native || 0),
+            liquidityUsd: Number(item.liquidity_usd || 0),
+            marketCap: item.market_cap ?? null,
+            fdv: item.fdv ?? null,
+            txns5m: {
+              buys: Number(item.buys_5m || 0),
+              sells: Number(item.sells_5m || 0),
+            },
+            volume5m: Number(item.volume_5m || 0),
+            priceChange5m: Number(item.change_5m || 0),
+            pairCreatedAt: item.pair_created_at || null,
+            socials: item.socials || [],
+            websites: item.websites || [],
+            url: item.dex_url || null,
+            marketUpdatedAt: item.market_updated_at || Date.now(),
+          };
         }
 
         try {
@@ -801,7 +908,7 @@ export async function marketAutoTradeTick() {
             profile,
             settings,
             mint: item.mint,
-            snapshot: evaluation.snapshot,
+            snapshot,
             source:
               profileName === "strict"
                 ? "market-scanner-strict"
@@ -824,19 +931,17 @@ export async function marketAutoTradeTick() {
           autoTradeStatus.lastOpenedAt = Date.now();
           autoTradeStatus.lastOpenedMint = item.mint;
           autoTradeStatus.lastOpenedSymbol =
-            evaluation.snapshot.baseToken?.symbol ||
-            item.symbol ||
-            item.mint.slice(0, 6);
+            item.symbol || item.mint.slice(0, 6);
 
           lastDecision =
             `opened PAPER ${autoTradeStatus.lastOpenedSymbol} ` +
-            `with ${Number(settings.buySizeSol).toFixed(4)} SOL live quote`;
+            `with ${Number(settings.buySizeSol).toFixed(4)} SOL ` +
+            `at live market price`;
 
           console.log(
             `AUTO PAPER ${profile.id}: ` +
-            `${autoTradeStatus.lastOpenedSymbol} ` +
-            `${item.mint} size=${settings.buySizeSol} ` +
-            `profile=${profileName}`
+            `${autoTradeStatus.lastOpenedSymbol} ${item.mint} ` +
+            `size=${settings.buySizeSol} profile=${profileName}`
           );
         } catch (error) {
           lastDecision = `paper entry failed: ${error.message}`;
@@ -845,10 +950,11 @@ export async function marketAutoTradeTick() {
       }
     }
 
-    if (!opened && inspected > 0) {
+    if (!opened) {
+      const summary = rejectionSummary(rejections);
       lastDecision =
-        `scanned ${inspected} markets / evaluated ${evaluations}; ` +
-        lastDecision;
+        `scanned ${inspected} / evaluated ${evaluations}` +
+        (summary ? ` · ${summary}` : "");
     }
 
     if (rankedMarkets.length) {

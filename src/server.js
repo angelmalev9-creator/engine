@@ -20,6 +20,7 @@ import {
 import { q, sb } from "./supabase.js";
 import {
   manageAllPositions,
+  paperSummary,
   scamCheck,
 } from "./trading.js";
 import {
@@ -80,28 +81,42 @@ app.get("/api/me/state", auth, async (req, res) => {
       tokenBalances(publicKey).catch(() => []),
     ]);
 
-    const positions = await q.userPositions(uid);
-    const closed = positions.filter(
+    const settings = mergeSettings(await q.settings(uid));
+    const positions = await q.userPositions(uid, 200);
+    const mode = settings.tradingMode === "live" ? "live" : "paper";
+    const liveTrading =
+      mode === "live" &&
+      config.liveTrading &&
+      profile.plan === "pro";
+
+    const modePositions = mode === "paper"
+      ? positions.filter(position => !position.buy_signature)
+      : positions.filter(position => Boolean(position.buy_signature));
+
+    const closed = modePositions.filter(
       position =>
         position.status === "closed" &&
         position.pnl_pct !== null
     );
 
+    const openStatus = mode === "paper" ? "alert" : "open";
+    const paper = paperSummary(positions, settings);
+
     res.json({
       ts: Date.now(),
       plan: profile.plan,
-      liveTrading:
-        config.liveTrading &&
-        profile.plan === "pro",
+      mode,
+      liveTrading,
       wallet: {
         publicKey,
         balanceSol: balance,
         funded: (balance || 0) > 0.001,
         tokens,
       },
-      settings: mergeSettings(await q.settings(uid)),
+      settings,
       defaults: DEFAULT_SETTINGS,
-      positions,
+      positions: modePositions,
+      paper,
       stats: {
         closedTrades: closed.length,
         winRate: closed.length
@@ -115,8 +130,8 @@ app.get("/api/me/state", auth, async (req, res) => {
             sum + Number(position.pnl_sol || 0),
           0
         ),
-        openPositions: positions.filter(
-          position => position.status === "open"
+        openPositions: modePositions.filter(
+          position => position.status === openStatus
         ).length,
       },
       transactions: await q.userTxs(uid),

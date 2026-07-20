@@ -32,6 +32,13 @@ export const DEFAULT_SETTINGS = {
   // and is still protected by the Railway LIVE_TRADING kill switch.
   tradingMode: "paper",
   paperStartingSol: 10,
+
+  // Automatically executes PAPER entries from the dense V3 market scanner.
+  // This never signs or broadcasts a Solana transaction.
+  paperAutoTradeEnabled: true,
+  paperAutoEntriesPerTick: 1,
+  paperReentryCooldownMin: 30,
+
   sniperEnabled: true,
   copytradeEnabled: true,
   buySizeSol: 0.1,          // sniper position size

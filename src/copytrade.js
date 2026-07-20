@@ -343,10 +343,26 @@ async function mirrorToFollowers(trader, traderSignature, { mint, side }, follow
           blockReason = "no live primary market pair after 15s retry";
         } else if (!gate?.pass) {
           blockReason = securityFailureReason(gate);
+        } else if (settings.tradingMode === "paper") {
+          const position = await openPositionFor({
+            userId,
+            profile,
+            settings,
+            mint,
+            snapshot,
+            source: "copytrade",
+            copiedFrom: trader,
+            sizeSol: settings.copySizeSol,
+          });
+
+          executed = Boolean(position);
+          blockReason = position
+            ? "PAPER trade opened with live Jupiter quote"
+            : "max positions reached or token already open";
         } else if (profile.plan !== "pro") {
-          blockReason = "FOMO plan — watch only";
+          blockReason = "LIVE trading requires PRO";
         } else if (!config.liveTrading) {
-          blockReason = "engine in signal mode";
+          blockReason = "Railway LIVE_TRADING kill switch is off";
         } else {
           const publicKey = await ensureUserWallet(userId);
           const balance = await balanceSol(publicKey).catch(() => 0);
@@ -371,8 +387,6 @@ async function mirrorToFollowers(trader, traderSignature, { mint, side }, follow
 
             if (!position) {
               blockReason = "max positions reached or token already open";
-            } else if (!executed) {
-              blockReason = "position created without a live transaction";
             }
           }
         }
@@ -385,8 +399,16 @@ async function mirrorToFollowers(trader, traderSignature, { mint, side }, follow
         );
 
         if (open) {
-          await closePositionFor(open, `copytrade: ${trader.slice(0, 6)} sold`, snapshot);
-          executed = open.status === "open";
+          const paper = open.status === "alert";
+          await closePositionFor(
+            open,
+            `copytrade: ${trader.slice(0, 6)} sold`,
+            snapshot
+          );
+          executed = true;
+          blockReason = paper
+            ? "PAPER trade closed with live Jupiter quote"
+            : null;
         } else {
           blockReason = "no copied position";
         }
@@ -394,7 +416,7 @@ async function mirrorToFollowers(trader, traderSignature, { mint, side }, follow
 
       await finalizeCopyEvent(eventId, {
         executed,
-        block_reason: executed ? null : blockReason,
+        block_reason: blockReason,
         our_signature: ourSignature,
       });
     } catch (error) {

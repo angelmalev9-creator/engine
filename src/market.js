@@ -54,6 +54,8 @@ let autoTradeStatus = {
   lastDecision: "waiting for live markets",
   evaluations: 0,
   opened: 0,
+  profile: "active",
+  rejections: {},
 };
 
 function nowIso() {
@@ -518,6 +520,51 @@ function entryPrefilter(item, entry) {
   return { pass: true, liquiditySol };
 }
 
+
+function activePaperEntry(entry) {
+  return {
+    ...entry,
+    // The active PAPER profile exists to create a useful test sample.
+    // It does not change LIVE execution rules.
+    minLiquiditySol: Math.min(Number(entry.minLiquiditySol || 15), 5),
+    minTxns5m: Math.min(Number(entry.minTxns5m || 80), 20),
+    minBuySellRatio: Math.min(Number(entry.minBuySellRatio || 2), 1.05),
+    maxPairAgeMin: Math.max(Number(entry.maxPairAgeMin || 60), 180),
+    requireDexPaid: false,
+    requireSocials: false,
+  };
+}
+
+function failedCheckText(evaluation) {
+  const checks = {
+    ...(evaluation?.checks || {}),
+    ...(evaluation?.security?.checks || {}),
+  };
+
+  return Object.entries(checks)
+    .filter(([, check]) => !check?.pass)
+    .map(([name, check]) => `${name}: ${check?.detail || "failed"}`)
+    .join(" | ");
+}
+
+// PAPER active mode still blocks the clear danger signals.
+// LP matching remains a warning because Rugcheck and DEXScreener pair
+// identifiers frequently differ even when the pool is real.
+function activePaperSecurityPass(security) {
+  const checks = security?.checks || {};
+
+  return Boolean(
+    checks.authorities?.pass &&
+    checks.topHolders?.pass &&
+    checks.rugcheck?.pass
+  );
+}
+
+function addRejection(rejections, reason) {
+  const key = String(reason || "unknown").slice(0, 120);
+  rejections[key] = (rejections[key] || 0) + 1;
+}
+
 function evaluationCacheKey(mint, entry) {
   return `${mint}:${JSON.stringify(entry)}`;
 }
@@ -568,14 +615,27 @@ export async function marketAutoTradeTick() {
   let opened = 0;
   let enabledUsers = 0;
   let lastDecision = "no PAPER user had entry capacity";
+  let profileName = "active";
+  const rejections = {};
 
   try {
     const profiles = await q.allProfiles();
+
     const rankedMarkets = [...items.values()]
-      .filter(item => item?.mint && item?.pair_address)
+      .filter(item =>
+        item?.mint &&
+        item?.pair_address &&
+        !item.market_stale &&
+        Number(item.price_usd) > 0
+      )
       .sort((left, right) =>
         safeNumber(right.trend_score) - safeNumber(left.trend_score)
       );
+
+    if (!rankedMarkets.length) {
+      lastDecision = "market feed has no fresh priced pairs yet";
+      addRejection(rejections, lastDecision);
+    }
 
     for (const profile of profiles) {
       const settings = mergeSettings(await q.settings(profile.id));
@@ -589,17 +649,30 @@ export async function marketAutoTradeTick() {
       }
 
       enabledUsers += 1;
+      profileName =
+        settings.paperStrategyProfile === "strict"
+          ? "strict"
+          : "active";
+
+      const entry =
+        profileName === "strict"
+          ? settings.entry
+          : activePaperEntry(settings.entry);
 
       const positions = await q.userPositions(profile.id, 250);
+
       const active = positions.filter(position =>
         position.status === "open" || position.status === "alert"
       );
 
-      let capacity =
-        Math.max(0, Number(settings.maxOpenPositions) - active.length);
+      let capacity = Math.max(
+        0,
+        Number(settings.maxOpenPositions) - active.length
+      );
 
       if (!capacity) {
         lastDecision = "max PAPER positions reached";
+        addRejection(rejections, lastDecision);
         continue;
       }
 
@@ -609,6 +682,7 @@ export async function marketAutoTradeTick() {
       );
 
       let remainingEntries = Math.min(capacity, entriesThisTick);
+
       const cooldownMinutes = Math.max(
         0,
         Number(settings.paperReentryCooldownMin || 30)
@@ -618,78 +692,101 @@ export async function marketAutoTradeTick() {
         if (!remainingEntries) break;
         if (evaluations >= AUTO_MAX_EVALUATIONS_PER_TICK) break;
 
-        const prefilter = entryPrefilter(item, settings.entry);
+        const prefilter = entryPrefilter(item, entry);
+
         if (!prefilter.pass) {
           lastDecision = prefilter.reason;
+          addRejection(rejections, prefilter.reason);
           continue;
         }
 
         if (
           active.some(position => position.mint === item.mint) ||
-          recentMintCooldown(
-            positions,
-            item.mint,
-            cooldownMinutes
-          )
+          recentMintCooldown(positions, item.mint, cooldownMinutes)
         ) {
-          lastDecision = "mint is open or inside re-entry cooldown";
+          lastDecision = "mint open or in re-entry cooldown";
+          addRejection(rejections, lastDecision);
           continue;
         }
 
         evaluations += 1;
 
         let evaluation;
+
         try {
-          evaluation = await cachedAutoEvaluation(
-            item.mint,
-            settings.entry
-          );
+          evaluation = await cachedAutoEvaluation(item.mint, entry);
         } catch (error) {
           lastDecision = `evaluation error: ${error.message}`;
+          addRejection(rejections, lastDecision);
           continue;
         }
 
-        if (!evaluation.tradeReady || !evaluation.snapshot) {
-          lastDecision = "candidate failed the complete strategy/security gate";
+        const securityPass =
+          profileName === "strict"
+            ? Boolean(evaluation.tradeReady)
+            : (
+                Object.values(evaluation.checks || {})
+                  .every(check => check.pass) &&
+                activePaperSecurityPass(evaluation.security)
+              );
+
+        if (!securityPass || !evaluation.snapshot) {
+          const failed =
+            failedCheckText(evaluation) ||
+            "candidate failed strategy/security";
+
+          lastDecision = failed;
+          addRejection(rejections, failed);
           continue;
         }
 
-        const position = await openPositionFor({
-          userId: profile.id,
-          profile,
-          settings,
-          mint: item.mint,
-          snapshot: evaluation.snapshot,
-          source: "market-scanner",
-          sizeSol: settings.buySizeSol,
-        });
+        try {
+          const position = await openPositionFor({
+            userId: profile.id,
+            profile,
+            settings,
+            mint: item.mint,
+            snapshot: evaluation.snapshot,
+            source:
+              profileName === "strict"
+                ? "market-scanner-strict"
+                : "market-scanner-active",
+            sizeSol: settings.buySizeSol,
+          });
 
-        if (!position) {
-          lastDecision = "position already open or maximum reached";
-          continue;
+          if (!position) {
+            lastDecision = "position already open or maximum reached";
+            addRejection(rejections, lastDecision);
+            continue;
+          }
+
+          opened += 1;
+          remainingEntries -= 1;
+          capacity -= 1;
+          active.push(position);
+          positions.push(position);
+
+          autoTradeStatus.lastOpenedAt = Date.now();
+          autoTradeStatus.lastOpenedMint = item.mint;
+          autoTradeStatus.lastOpenedSymbol =
+            evaluation.snapshot.baseToken?.symbol ||
+            item.symbol ||
+            item.mint.slice(0, 6);
+
+          lastDecision =
+            `opened PAPER ${autoTradeStatus.lastOpenedSymbol} ` +
+            `with ${Number(settings.buySizeSol).toFixed(4)} SOL live quote`;
+
+          console.log(
+            `AUTO PAPER ${profile.id}: ` +
+            `${autoTradeStatus.lastOpenedSymbol} ` +
+            `${item.mint} size=${settings.buySizeSol} ` +
+            `profile=${profileName}`
+          );
+        } catch (error) {
+          lastDecision = `paper entry failed: ${error.message}`;
+          addRejection(rejections, lastDecision);
         }
-
-        opened += 1;
-        remainingEntries -= 1;
-        capacity -= 1;
-        active.push(position);
-        positions.push(position);
-
-        autoTradeStatus.lastOpenedAt = Date.now();
-        autoTradeStatus.lastOpenedMint = item.mint;
-        autoTradeStatus.lastOpenedSymbol =
-          evaluation.snapshot.baseToken?.symbol ||
-          item.symbol ||
-          item.mint.slice(0, 6);
-
-        lastDecision =
-          `opened PAPER ${autoTradeStatus.lastOpenedSymbol} ` +
-          `with ${Number(settings.buySizeSol).toFixed(4)} SOL live quote`;
-
-        console.log(
-          `AUTO PAPER ${profile.id}: ${autoTradeStatus.lastOpenedSymbol} ` +
-          `${item.mint} size=${settings.buySizeSol}`
-        );
       }
     }
   } finally {
@@ -700,6 +797,8 @@ export async function marketAutoTradeTick() {
       lastDecision,
       evaluations,
       opened,
+      profile: profileName,
+      rejections,
     };
 
     autoTradeRunning = false;

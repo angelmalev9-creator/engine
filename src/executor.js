@@ -1,75 +1,236 @@
-// Jupiter v6 execution, parameterized per user keypair. dryRun=true never signs.
+// Jupiter quote/swap execution.
+// PAPER mode requests a real quote but never signs or broadcasts a transaction.
 import { VersionedTransaction } from "@solana/web3.js";
 import bs58 from "bs58";
 import { config } from "./config.js";
 import { withRpc } from "./rpc.js";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
-const JUP = "https://quote-api.jup.ag/v6";
+
+// The current official Swap API is tried first. Older gateways remain fallbacks
+// so PAPER testing does not stop during a migration or temporary gateway issue.
+const JUPITER_BASES = [
+  "https://api.jup.ag/swap/v1",
+  "https://lite-api.jup.ag/swap/v1",
+  "https://quote-api.jup.ag/v6",
+];
 
 export async function dynamicPriorityFee() {
   try {
-    const fees = await withRpc(c => c.getRecentPrioritizationFees());
-    const v = fees.map(f => f.prioritizationFee).filter(x => x > 0).sort((a, b) => a - b);
-    if (!v.length) return 50_000;
-    return Math.min(Math.max(v[Math.floor(v.length * 0.75)] * 2, 50_000), 2_000_000);
-  } catch { return 100_000; }
+    const fees = await withRpc(connection =>
+      connection.getRecentPrioritizationFees()
+    );
+
+    const values = fees
+      .map(fee => fee.prioritizationFee)
+      .filter(value => value > 0)
+      .sort((left, right) => left - right);
+
+    if (!values.length) return 50_000;
+
+    return Math.min(
+      Math.max(values[Math.floor(values.length * 0.75)] * 2, 50_000),
+      2_000_000
+    );
+  } catch {
+    return 100_000;
+  }
+}
+
+async function requestJson(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      accept: "application/json",
+      ...(options.headers || {}),
+    },
+  });
+
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    const detail =
+      payload?.error ||
+      payload?.message ||
+      `${response.status} ${response.statusText}`;
+
+    throw new Error(detail);
+  }
+
+  return payload;
 }
 
 async function quote(inputMint, outputMint, amount, slippageBps) {
-  const r = await fetch(`${JUP}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`);
-  if (!r.ok) throw new Error(`Jupiter quote ${r.status}`);
-  return r.json();
+  const params = new URLSearchParams({
+    inputMint,
+    outputMint,
+    amount: String(Math.trunc(Number(amount))),
+    slippageBps: String(Math.trunc(Number(slippageBps))),
+    restrictIntermediateTokens: "true",
+  });
+
+  const errors = [];
+
+  for (const apiBase of JUPITER_BASES) {
+    try {
+      const quoteResponse = await requestJson(
+        `${apiBase}/quote?${params.toString()}`
+      );
+
+      if (!quoteResponse?.outAmount || Number(quoteResponse.outAmount) <= 0) {
+        throw new Error("quote returned no output amount");
+      }
+
+      return { quoteResponse, apiBase };
+    } catch (error) {
+      errors.push(`${apiBase}: ${error.message}`);
+    }
+  }
+
+  throw new Error(`Jupiter quote failed — ${errors.join(" | ")}`);
 }
 
-async function swapTx(quoteResponse, userPublicKey, fee) {
-  const r = await fetch(`${JUP}/swap`, {
-    method: "POST", headers: { "content-type": "application/json" },
+async function swapTx(quoteResponse, userPublicKey, fee, apiBase) {
+  const payload = await requestJson(`${apiBase}/swap`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      quoteResponse, userPublicKey, wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true, computeUnitPriceMicroLamports: fee,
+      quoteResponse,
+      userPublicKey,
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      computeUnitPriceMicroLamports: fee,
     }),
   });
-  if (!r.ok) throw new Error(`Jupiter swap ${r.status}`);
-  return VersionedTransaction.deserialize(Buffer.from((await r.json()).swapTransaction, "base64"));
+
+  if (!payload?.swapTransaction) {
+    throw new Error("Jupiter swap returned no transaction");
+  }
+
+  return VersionedTransaction.deserialize(
+    Buffer.from(payload.swapTransaction, "base64")
+  );
 }
 
-async function broadcast(tx, keypair) {
-  tx.sign([keypair]);
+async function broadcast(transaction, keypair) {
+  transaction.sign([keypair]);
+
   if (config.jito.enabled) {
     try {
-      const r = await fetch(`${config.jito.blockEngine}/api/v1/transactions`, {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendTransaction", params: [bs58.encode(tx.serialize())] }),
-      });
-      const j = await r.json();
-      if (!j.error) return j.result;
-    } catch { /* fall through */ }
+      const response = await fetch(
+        `${config.jito.blockEngine}/api/v1/transactions`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "sendTransaction",
+            params: [bs58.encode(transaction.serialize())],
+          }),
+        }
+      );
+
+      const payload = await response.json();
+
+      if (!payload.error) return payload.result;
+    } catch {
+      // Fall through to the configured Solana RPC.
+    }
   }
-  return withRpc(c => c.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 }));
+
+  return withRpc(connection =>
+    connection.sendRawTransaction(transaction.serialize(), {
+      skipPreflight: true,
+      maxRetries: 3,
+    })
+  );
 }
 
-async function confirm(sig) {
-  return withRpc(async c => {
-    const bh = await c.getLatestBlockhash("confirmed");
-    const conf = await c.confirmTransaction({ signature: sig, ...bh }, "confirmed");
-    if (conf.value.err) throw new Error(`Tx failed: ${JSON.stringify(conf.value.err)}`);
-    return sig;
+async function confirm(signature) {
+  return withRpc(async connection => {
+    const blockhash = await connection.getLatestBlockhash("confirmed");
+    const confirmation = await connection.confirmTransaction(
+      { signature, ...blockhash },
+      "confirmed"
+    );
+
+    if (confirmation.value.err) {
+      throw new Error(`Tx failed: ${JSON.stringify(confirmation.value.err)}`);
+    }
+
+    return signature;
   });
 }
 
-export async function swap({ keypair, inputMint, outputMint, amountRaw, slippageBps, dryRun }) {
-  const qr = await quote(inputMint, outputMint, amountRaw, slippageBps);
-  if (dryRun) return { signature: null, quote: qr, dryRun: true };
+export async function swap({
+  keypair,
+  inputMint,
+  outputMint,
+  amountRaw,
+  slippageBps,
+  dryRun,
+}) {
+  const { quoteResponse, apiBase } = await quote(
+    inputMint,
+    outputMint,
+    amountRaw,
+    slippageBps
+  );
+
+  if (dryRun) {
+    return {
+      signature: null,
+      quote: quoteResponse,
+      dryRun: true,
+      quoteApi: apiBase,
+    };
+  }
+
+  if (!keypair) {
+    throw new Error("A keypair is required for LIVE execution");
+  }
+
   const fee = await dynamicPriorityFee();
-  const tx = await swapTx(qr, keypair.publicKey.toBase58(), fee);
-  const sig = await broadcast(tx, keypair);
-  await confirm(sig);
-  return { signature: sig, quote: qr };
+  const transaction = await swapTx(
+    quoteResponse,
+    keypair.publicKey.toBase58(),
+    fee,
+    apiBase
+  );
+
+  const signature = await broadcast(transaction, keypair);
+  await confirm(signature);
+
+  return { signature, quote: quoteResponse, quoteApi: apiBase };
 }
 
-export const buySol = (keypair, mint, solAmount, slippageBps, dryRun) =>
-  swap({ keypair, inputMint: SOL_MINT, outputMint: mint, amountRaw: Math.floor(solAmount * 1e9), slippageBps, dryRun });
+export const buySol = (
+  keypair,
+  mint,
+  solAmount,
+  slippageBps,
+  dryRun
+) => swap({
+  keypair,
+  inputMint: SOL_MINT,
+  outputMint: mint,
+  amountRaw: Math.floor(Number(solAmount) * 1e9),
+  slippageBps,
+  dryRun,
+});
 
-export const sellAll = (keypair, mint, rawTokenAmount, slippageBps, dryRun) =>
-  swap({ keypair, inputMint: mint, outputMint: SOL_MINT, amountRaw: rawTokenAmount, slippageBps, dryRun });
+export const sellAll = (
+  keypair,
+  mint,
+  rawTokenAmount,
+  slippageBps,
+  dryRun
+) => swap({
+  keypair,
+  inputMint: mint,
+  outputMint: SOL_MINT,
+  amountRaw: Math.trunc(Number(rawTokenAmount)),
+  slippageBps,
+  dryRun,
+});

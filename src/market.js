@@ -41,8 +41,11 @@ let refreshRunning = false;
 let securityRunning = false;
 let autoTradeRunning = false;
 
-const AUTO_EVALUATION_TTL = 60_000;
-const AUTO_MAX_EVALUATIONS_PER_TICK = 3;
+const AUTO_EVALUATION_TTL = 30_000;
+const AUTO_MAX_EVALUATIONS_PER_TICK = 15;
+const AUTO_MAX_INSPECTIONS_PER_TICK = 90;
+
+let autoCandidateCursor = 0;
 const autoEvaluationCache = new Map();
 
 let autoTradeStatus = {
@@ -524,12 +527,12 @@ function entryPrefilter(item, entry) {
 function activePaperEntry(entry) {
   return {
     ...entry,
-    // The active PAPER profile exists to create a useful test sample.
-    // It does not change LIVE execution rules.
-    minLiquiditySol: Math.min(Number(entry.minLiquiditySol || 15), 5),
-    minTxns5m: Math.min(Number(entry.minTxns5m || 80), 20),
-    minBuySellRatio: Math.min(Number(entry.minBuySellRatio || 2), 1.05),
-    maxPairAgeMin: Math.max(Number(entry.maxPairAgeMin || 60), 180),
+    // ACTIVE is deliberately broad enough to build a PAPER performance sample.
+    // It never changes LIVE-money entry rules.
+    minLiquiditySol: Math.min(Number(entry.minLiquiditySol || 15), 2),
+    minTxns5m: Math.min(Number(entry.minTxns5m || 80), 5),
+    minBuySellRatio: Math.min(Number(entry.minBuySellRatio || 2), 0.8),
+    maxPairAgeMin: Math.max(Number(entry.maxPairAgeMin || 60), 720),
     requireDexPaid: false,
     requireSocials: false,
   };
@@ -550,14 +553,46 @@ function failedCheckText(evaluation) {
 // PAPER active mode still blocks the clear danger signals.
 // LP matching remains a warning because Rugcheck and DEXScreener pair
 // identifiers frequently differ even when the pool is real.
+function isUnavailableCheck(check) {
+  const detail = String(check?.detail || "").toLowerCase();
+
+  return (
+    detail.includes("unavailable") ||
+    detail.includes("no rugcheck score") ||
+    detail.includes("not readable") ||
+    detail.includes("timeout") ||
+    detail.includes("429") ||
+    detail.includes("503")
+  );
+}
+
 function activePaperSecurityPass(security) {
   const checks = security?.checks || {};
 
-  return Boolean(
-    checks.authorities?.pass &&
-    checks.topHolders?.pass &&
-    checks.rugcheck?.pass
-  );
+  // A real active mint/freeze authority is always blocked.
+  if (!checks.authorities?.pass) return false;
+
+  // Explicitly excessive holder concentration is blocked.
+  // Temporary provider/RPC gaps remain warnings in PAPER only.
+  if (
+    checks.topHolders &&
+    !checks.topHolders.pass &&
+    !isUnavailableCheck(checks.topHolders)
+  ) {
+    return false;
+  }
+
+  // A real bad Rugcheck score is blocked. Missing provider data is a warning
+  // in ACTIVE PAPER so the performance test does not stall forever.
+  if (
+    checks.rugcheck &&
+    !checks.rugcheck.pass &&
+    !isUnavailableCheck(checks.rugcheck)
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 function addRejection(rejections, reason) {
@@ -614,6 +649,7 @@ export async function marketAutoTradeTick() {
   let evaluations = 0;
   let opened = 0;
   let enabledUsers = 0;
+  let inspected = 0;
   let lastDecision = "no PAPER user had entry capacity";
   let profileName = "active";
   const rejections = {};
@@ -636,6 +672,19 @@ export async function marketAutoTradeTick() {
       lastDecision = "market feed has no fresh priced pairs yet";
       addRejection(rejections, lastDecision);
     }
+
+    const startIndex = rankedMarkets.length
+      ? autoCandidateCursor % rankedMarkets.length
+      : 0;
+
+    // Rotate through the full feed instead of evaluating the same top three
+    // rejected tokens forever.
+    const rotatedMarkets = rankedMarkets.length
+      ? [
+          ...rankedMarkets.slice(startIndex),
+          ...rankedMarkets.slice(0, startIndex),
+        ]
+      : [];
 
     for (const profile of profiles) {
       const settings = mergeSettings(await q.settings(profile.id));
@@ -688,9 +737,12 @@ export async function marketAutoTradeTick() {
         Number(settings.paperReentryCooldownMin || 30)
       );
 
-      for (const item of rankedMarkets) {
+      for (const item of rotatedMarkets) {
         if (!remainingEntries) break;
         if (evaluations >= AUTO_MAX_EVALUATIONS_PER_TICK) break;
+        if (inspected >= AUTO_MAX_INSPECTIONS_PER_TICK) break;
+
+        inspected += 1;
 
         const prefilter = entryPrefilter(item, entry);
 
@@ -721,12 +773,15 @@ export async function marketAutoTradeTick() {
           continue;
         }
 
+        const velocityPass = Object.values(
+          evaluation.checks || {}
+        ).every(check => check.pass);
+
         const securityPass =
           profileName === "strict"
             ? Boolean(evaluation.tradeReady)
             : (
-                Object.values(evaluation.checks || {})
-                  .every(check => check.pass) &&
+                velocityPass &&
                 activePaperSecurityPass(evaluation.security)
               );
 
@@ -789,6 +844,17 @@ export async function marketAutoTradeTick() {
         }
       }
     }
+
+    if (!opened && inspected > 0) {
+      lastDecision =
+        `scanned ${inspected} markets / evaluated ${evaluations}; ` +
+        lastDecision;
+    }
+
+    if (rankedMarkets.length) {
+      autoCandidateCursor =
+        (startIndex + Math.max(1, inspected)) % rankedMarkets.length;
+    }
   } finally {
     autoTradeStatus = {
       ...autoTradeStatus,
@@ -796,6 +862,7 @@ export async function marketAutoTradeTick() {
       lastRunAt: runStartedAt,
       lastDecision,
       evaluations,
+      inspected,
       opened,
       profile: profileName,
       rejections,

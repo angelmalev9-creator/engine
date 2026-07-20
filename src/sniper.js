@@ -322,21 +322,20 @@ async function fanOutBuy(mint, snapshot) {
       const settings = mergeSettings(await q.settings(profile.id));
       if (!settings.sniperEnabled) continue;
 
-      if (settings.tradingMode === "live") {
-        const publicKey = await ensureUserWallet(profile.id);
-        const balance = await balanceSol(publicKey).catch(() => 0);
-        const required = Number(settings.buySizeSol) + 0.01;
+      const publicKey = await ensureUserWallet(profile.id);
+      const balance = await balanceSol(publicKey).catch(() => 0);
+      const funded =
+        balance >= Number(settings.buySizeSol) + 0.01;
 
-        if (
-          profile.plan !== "pro" ||
-          !config.liveTrading ||
-          balance < required
-        ) {
-          console.log(
-            `sniper live skip ${profile.id}: plan=${profile.plan}, global=${config.liveTrading}, balance=${balance.toFixed(4)}`
-          );
-          continue;
-        }
+      if (
+        profile.plan === "pro" &&
+        config.liveTrading &&
+        !funded
+      ) {
+        console.log(
+          `sniper skip ${profile.id}: insufficient balance ${balance.toFixed(4)} SOL`
+        );
+        continue;
       }
 
       await openPositionFor({

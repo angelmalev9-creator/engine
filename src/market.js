@@ -16,7 +16,10 @@ import {
   tokenPairsBatch,
   topBoosted,
 } from "./dexscreener.js";
+import { mergeSettings } from "./config.js";
 import { runSecurityGate } from "./security.js";
+import { q } from "./supabase.js";
+import { evaluateToken, openPositionFor } from "./trading.js";
 
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
 const FEED_LIMIT = 180;
@@ -36,6 +39,22 @@ let refreshCursor = 0;
 let discoveryRunning = false;
 let refreshRunning = false;
 let securityRunning = false;
+let autoTradeRunning = false;
+
+const AUTO_EVALUATION_TTL = 60_000;
+const AUTO_MAX_EVALUATIONS_PER_TICK = 3;
+const autoEvaluationCache = new Map();
+
+let autoTradeStatus = {
+  enabledUsers: 0,
+  lastRunAt: null,
+  lastOpenedAt: null,
+  lastOpenedMint: null,
+  lastOpenedSymbol: null,
+  lastDecision: "waiting for live markets",
+  evaluations: 0,
+  opened: 0,
+};
 
 function nowIso() {
   return new Date().toISOString();
@@ -441,6 +460,257 @@ export async function marketSecurityTick() {
   }
 }
 
+
+function entryPrefilter(item, entry) {
+  if (!item?.mint || !item.pair_address) {
+    return { pass: false, reason: "missing pair" };
+  }
+
+  if (item.market_stale || !Number(item.price_usd)) {
+    return { pass: false, reason: "stale market" };
+  }
+
+  if (
+    item.age_minutes !== null &&
+    item.age_minutes !== undefined &&
+    Number(item.age_minutes) > Number(entry.maxPairAgeMin)
+  ) {
+    return { pass: false, reason: "pair too old" };
+  }
+
+  const transactions = safeNumber(item.txns_5m);
+  if (transactions <= Number(entry.minTxns5m)) {
+    return { pass: false, reason: "not enough 5m transactions" };
+  }
+
+  if (safeNumber(item.buy_sell_ratio) < Number(entry.minBuySellRatio)) {
+    return { pass: false, reason: "buy/sell ratio too low" };
+  }
+
+  if (entry.requireDexPaid && !item.dex_paid) {
+    return { pass: false, reason: "DEX paid/boost required" };
+  }
+
+  if (entry.requireSocials && !(item.socials || []).length) {
+    return { pass: false, reason: "social profile required" };
+  }
+
+  // Convert the pool's USD liquidity to an approximate SOL value using the
+  // token's USD/native relationship returned by DEXScreener.
+  const solUsd =
+    safeNumber(item.price_native) > 0 &&
+    safeNumber(item.price_usd) > 0
+      ? safeNumber(item.price_usd) / safeNumber(item.price_native)
+      : null;
+
+  const liquiditySol =
+    solUsd && solUsd > 0
+      ? safeNumber(item.liquidity_usd) / solUsd
+      : null;
+
+  if (
+    liquiditySol === null ||
+    liquiditySol <= Number(entry.minLiquiditySol)
+  ) {
+    return { pass: false, reason: "liquidity below strategy minimum" };
+  }
+
+  return { pass: true, liquiditySol };
+}
+
+function evaluationCacheKey(mint, entry) {
+  return `${mint}:${JSON.stringify(entry)}`;
+}
+
+async function cachedAutoEvaluation(mint, entry) {
+  const key = evaluationCacheKey(mint, entry);
+  const hit = autoEvaluationCache.get(key);
+
+  if (hit && Date.now() - hit.ts < AUTO_EVALUATION_TTL) {
+    return hit.value;
+  }
+
+  const value = await evaluateToken(mint, entry);
+  autoEvaluationCache.set(key, { ts: Date.now(), value });
+
+  if (autoEvaluationCache.size > 300) {
+    const cutoff = Date.now() - AUTO_EVALUATION_TTL;
+
+    for (const [cacheKey, entryValue] of autoEvaluationCache) {
+      if (entryValue.ts < cutoff) autoEvaluationCache.delete(cacheKey);
+    }
+  }
+
+  return value;
+}
+
+function recentMintCooldown(positions, mint, cooldownMinutes) {
+  const cutoff = Date.now() - Math.max(0, cooldownMinutes) * 60_000;
+
+  return positions.some(position => {
+    if (position.mint !== mint) return false;
+
+    const openedAt = new Date(position.opened_at || 0).getTime();
+    return Number.isFinite(openedAt) && openedAt >= cutoff;
+  });
+}
+
+// Connects the dense DEX-style scanner to the PAPER wallet.
+//
+// It intentionally refuses LIVE mode. Real-money execution remains protected
+// behind the separate per-user LIVE selection and Railway kill switch.
+export async function marketAutoTradeTick() {
+  if (autoTradeRunning) return;
+  autoTradeRunning = true;
+
+  const runStartedAt = Date.now();
+  let evaluations = 0;
+  let opened = 0;
+  let enabledUsers = 0;
+  let lastDecision = "no PAPER user had entry capacity";
+
+  try {
+    const profiles = await q.allProfiles();
+    const rankedMarkets = [...items.values()]
+      .filter(item => item?.mint && item?.pair_address)
+      .sort((left, right) =>
+        safeNumber(right.trend_score) - safeNumber(left.trend_score)
+      );
+
+    for (const profile of profiles) {
+      const settings = mergeSettings(await q.settings(profile.id));
+
+      if (
+        settings.tradingMode !== "paper" ||
+        !settings.sniperEnabled ||
+        settings.paperAutoTradeEnabled === false
+      ) {
+        continue;
+      }
+
+      enabledUsers += 1;
+
+      const positions = await q.userPositions(profile.id, 250);
+      const active = positions.filter(position =>
+        position.status === "open" || position.status === "alert"
+      );
+
+      let capacity =
+        Math.max(0, Number(settings.maxOpenPositions) - active.length);
+
+      if (!capacity) {
+        lastDecision = "max PAPER positions reached";
+        continue;
+      }
+
+      const entriesThisTick = Math.max(
+        1,
+        Math.min(3, Number(settings.paperAutoEntriesPerTick || 1))
+      );
+
+      let remainingEntries = Math.min(capacity, entriesThisTick);
+      const cooldownMinutes = Math.max(
+        0,
+        Number(settings.paperReentryCooldownMin || 30)
+      );
+
+      for (const item of rankedMarkets) {
+        if (!remainingEntries) break;
+        if (evaluations >= AUTO_MAX_EVALUATIONS_PER_TICK) break;
+
+        const prefilter = entryPrefilter(item, settings.entry);
+        if (!prefilter.pass) {
+          lastDecision = prefilter.reason;
+          continue;
+        }
+
+        if (
+          active.some(position => position.mint === item.mint) ||
+          recentMintCooldown(
+            positions,
+            item.mint,
+            cooldownMinutes
+          )
+        ) {
+          lastDecision = "mint is open or inside re-entry cooldown";
+          continue;
+        }
+
+        evaluations += 1;
+
+        let evaluation;
+        try {
+          evaluation = await cachedAutoEvaluation(
+            item.mint,
+            settings.entry
+          );
+        } catch (error) {
+          lastDecision = `evaluation error: ${error.message}`;
+          continue;
+        }
+
+        if (!evaluation.tradeReady || !evaluation.snapshot) {
+          lastDecision = "candidate failed the complete strategy/security gate";
+          continue;
+        }
+
+        const position = await openPositionFor({
+          userId: profile.id,
+          profile,
+          settings,
+          mint: item.mint,
+          snapshot: evaluation.snapshot,
+          source: "market-scanner",
+          sizeSol: settings.buySizeSol,
+        });
+
+        if (!position) {
+          lastDecision = "position already open or maximum reached";
+          continue;
+        }
+
+        opened += 1;
+        remainingEntries -= 1;
+        capacity -= 1;
+        active.push(position);
+        positions.push(position);
+
+        autoTradeStatus.lastOpenedAt = Date.now();
+        autoTradeStatus.lastOpenedMint = item.mint;
+        autoTradeStatus.lastOpenedSymbol =
+          evaluation.snapshot.baseToken?.symbol ||
+          item.symbol ||
+          item.mint.slice(0, 6);
+
+        lastDecision =
+          `opened PAPER ${autoTradeStatus.lastOpenedSymbol} ` +
+          `with ${Number(settings.buySizeSol).toFixed(4)} SOL live quote`;
+
+        console.log(
+          `AUTO PAPER ${profile.id}: ${autoTradeStatus.lastOpenedSymbol} ` +
+          `${item.mint} size=${settings.buySizeSol}`
+        );
+      }
+    }
+  } finally {
+    autoTradeStatus = {
+      ...autoTradeStatus,
+      enabledUsers,
+      lastRunAt: runStartedAt,
+      lastDecision,
+      evaluations,
+      opened,
+    };
+
+    autoTradeRunning = false;
+  }
+}
+
+export function getAutoTradeStatus() {
+  return { ...autoTradeStatus };
+}
+
+
 function publicItem(item) {
   return {
     ...item,
@@ -460,6 +730,7 @@ export function getMarketFeed() {
     discoveryTs,
     refreshTs,
     count: list.length,
+    autoTrader: getAutoTradeStatus(),
     items: list,
   };
 }
@@ -614,6 +885,7 @@ export function marketStatus() {
     discoveryTs,
     refreshTs,
     count: items.size,
+    autoTrader: getAutoTradeStatus(),
     generatedAt: nowIso(),
   };
 }
